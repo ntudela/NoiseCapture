@@ -4,27 +4,8 @@
  *  The 'OnoMaP' system is led by Lab-STICC and Univ Eiffel - UMRAE and generates noise maps via
  *  citizen-contributed noise data.
  *
- *  This application is co-funded by the ENERGIC-OD Project (European Network for
- *  Redistributing Geospatial Information to user Communities - Open Data). ENERGIC-OD
- *  (http://www.energic-od.eu/) is partially funded under the ICT Policy Support Programme (ICT
- *  PSP) as part of the Competitiveness and Innovation Framework Programme by the European
- *  Community. The application work is also supported by the French geographic portal GEOPAL of the
- *  Pays de la Loire region (http://www.geopal.org).
- *
- *  Copyright (C) Univ Eiffel - UMRAE and Lab-STICC – CNRS UMR 6285 Equipe DECIDE Vannes
- *
- *  NoiseCapture is a free software; you can redistribute it and/or modify it under the terms of the
- *  GNU General Public License as published by the Free Software Foundation; either version 3 of
- *  the License, or(at your option) any later version. NoiseCapture is distributed in the hope that
- *  it will be useful,but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- *  more details.You should have received a copy of the GNU General Public License along with this
- *  program; if not, write to the Free Software Foundation,Inc., 51 Franklin Street, Fifth Floor,
- *  Boston, MA 02110-1301  USA or see For more information,  write to Université Gustave Eiffel,
- *  14-20 Boulevard Newton Cite Descartes, Champs sur Marne F-77447 Marne la Vallee Cedex 2 FRANCE
- *   or write to scientific.computing@univ-eiffel.fr
+ *  NoiseCapture is free software under the GNU General Public License version 3 or later.
  */
-
 package org.noise_planet.noisecapture;
 
 import android.app.Activity;
@@ -32,6 +13,9 @@ import android.content.SharedPreferences;
 import android.preference.PreferenceManager;
 import android.util.Base64;
 import android.util.Base64OutputStream;
+import android.util.Log;
+
+import org.noise_planet.noisecapture.routesilenciosa.RouteSilenciosaUploadClient;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -46,9 +30,14 @@ import java.util.regex.Pattern;
 import javax.net.ssl.HttpsURLConnection;
 
 /**
- * Communicate with WPS server in order to upload measurements
+ * Communicate with WPS server in order to upload measurements.
+ *
+ * The optional Ruta Silenciosa upload is intentionally isolated from the official
+ * Noise-Planet flow. A failure in the project API never invalidates a successful
+ * upload to Noise-Planet.
  */
 public class MeasurementUploadWPS {
+    private static final String TAG = "MeasurementUploadWPS";
     Activity activity;
     public static final String BASE_URL = "https://onomap-gs.noise-planet.org";
 
@@ -59,12 +48,6 @@ public class MeasurementUploadWPS {
     public void uploadRecord(int recordId) throws IOException {
         MeasurementExport measurementExport = new MeasurementExport(activity);
         MeasurementManager measurementManager = new MeasurementManager(activity);
-
-        // Check if this record has not been already uploaded
-        //Storage.Record record = measurementManager.getRecord(recordId);
-        //if(!record.getUploadId().isEmpty()) {
-        //    throw new IOException(activity.getText(R.string.error_already_uploaded).toString());
-        //}
 
         SharedPreferences sharedPref = PreferenceManager.getDefaultSharedPreferences(activity);
         String serverUrl = sharedPref.getString("settings_onomap_url", BASE_URL);
@@ -77,13 +60,11 @@ public class MeasurementUploadWPS {
         conn.setDoInput(true);
         conn.setDoOutput(true);
 
-
         OutputStream os = conn.getOutputStream();
         try {
-            // Copy beginning of WPS query XML file
             InputStream inputStream = activity.getResources().openRawResource(R.raw.wps_begin);
             try {
-                byte buf[] = new byte[1024];
+                byte[] buf = new byte[1024];
                 int len;
                 while ((len = inputStream.read(buf)) != -1) {
                     os.write(buf, 0, len);
@@ -91,17 +72,18 @@ public class MeasurementUploadWPS {
             } finally {
                 inputStream.close();
             }
-            // Copy content of zip file
-            Base64OutputStream base64OutputStream = new Base64OutputStream(os, Base64.NO_CLOSE | Base64.NO_WRAP);
+
+            Base64OutputStream base64OutputStream = new Base64OutputStream(
+                    os, Base64.NO_CLOSE | Base64.NO_WRAP);
             try {
                 measurementExport.exportRecord(recordId, base64OutputStream, false);
             } finally {
                 base64OutputStream.close();
             }
-            // Copy end of WPS query XML file
+
             inputStream = activity.getResources().openRawResource(R.raw.wps_end);
             try {
-                byte buf[] = new byte[1024];
+                byte[] buf = new byte[1024];
                 int len;
                 while ((len = inputStream.read(buf)) != -1) {
                     os.write(buf, 0, len);
@@ -112,28 +94,39 @@ public class MeasurementUploadWPS {
         } finally {
             os.close();
         }
-        int responseCode=conn.getResponseCode();
 
+        int responseCode = conn.getResponseCode();
         if (responseCode == HttpsURLConnection.HTTP_OK) {
             String line;
-            BufferedReader br=new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
             StringBuilder uuid = new StringBuilder();
-            while ((line=br.readLine()) != null) {
+            while ((line = br.readLine()) != null) {
                 uuid.append(line);
             }
-            // Update Track UUID
-            Pattern pattern = Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
+            Pattern pattern = Pattern.compile(
+                    "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
             Matcher matcher = pattern.matcher(uuid.toString());
-            if(matcher.matches()) {
+            if (matcher.matches()) {
                 measurementManager.updateRecordUUID(recordId, uuid.toString());
+                uploadToRouteSilenciosaBestEffort(recordId);
             } else {
-                throw new IOException("Illegal track UUID :"+uuid.toString());
+                throw new IOException("Illegal track UUID :" + uuid);
             }
         } else {
-            // Transfer failed
             throw new IOException("Failed to transfer measurement "
-                    + conn.getResponseMessage()+" [code:"+responseCode+"]");
+                    + conn.getResponseMessage() + " [code:" + responseCode + "]");
         }
+    }
 
+    private void uploadToRouteSilenciosaBestEffort(int recordId) {
+        try {
+            RouteSilenciosaUploadClient client = new RouteSilenciosaUploadClient(activity);
+            if (client.isEnabled()) {
+                client.uploadRecord(recordId);
+            }
+        } catch (IOException | RuntimeException ex) {
+            // Keep the official upload successful even if the project API is unavailable.
+            Log.e(TAG, "Ruta Silenciosa upload failed", ex);
+        }
     }
 }
